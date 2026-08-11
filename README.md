@@ -125,6 +125,8 @@ make build
 
 Run `make help` to list the available development and Herdr integration targets.
 
+Before publishing a release, follow the [release checklist](docs/release-checklist.md).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
