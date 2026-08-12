@@ -116,9 +116,9 @@ Install the plugin directly from the GitHub release candidate ref:
 
 ```sh
 herdr plugin install \
+  tkuchiki/herdr-plugin-k8s-context \
   --ref codex/initial-release \
-  --yes \
-  tkuchiki/herdr-plugin-k8s-context
+  --yes
 
 herdr plugin list --plugin herdr.k8s-context
 ```
@@ -292,7 +292,7 @@ Finally, test the immutable release ref in a new disposable container:
 
 ```sh
 herdr plugin install \
+  tkuchiki/herdr-plugin-k8s-context \
   --ref "v$RELEASE_VERSION" \
-  --yes \
-  tkuchiki/herdr-plugin-k8s-context
+  --yes
 ```
