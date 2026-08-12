@@ -88,12 +88,29 @@ apt-get install -y ca-certificates curl git
 curl -fsSL https://herdr.dev/install.sh | sh
 export PATH="/root/.local/bin:$PATH"
 
-go install k8s.io/kubectl/cmd/kubectl@v0.36.3
+KUBECTL_VERSION=v1.36.3
+case "$(uname -m)" in
+  x86_64) KUBECTL_ARCH=amd64 ;;
+  aarch64 | arm64) KUBECTL_ARCH=arm64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+curl -fL \
+  -o /tmp/kubectl \
+  "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl"
+curl -fL \
+  -o /tmp/kubectl.sha256 \
+  "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl.sha256"
+echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum --check
+install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+rm /tmp/kubectl /tmp/kubectl.sha256
 
 herdr --version
 go version
 kubectl version --client
 ```
+
+This follows the official Kubernetes binary installation method and verifies the downloaded checksum. `kubectl` is not installed with `go install` because the `k8s.io/kubectl` module does not expose `cmd/kubectl` as an installable package.
 
 Install the plugin directly from the GitHub release candidate ref:
 
