@@ -31,7 +31,7 @@ make link
 Invoke the action from a terminal:
 
 ```sh
-make open
+herdr plugin action invoke open --plugin herdr.k8s-context
 ```
 
 To assign a key, add an entry like this to the Herdr configuration:
@@ -131,6 +131,8 @@ The generated kubeconfig is retained while the restored tab still exists and is 
 ```sh
 make check
 make build
+make link
+make open
 ```
 
 Run `make help` to list the available development and Herdr integration targets.
