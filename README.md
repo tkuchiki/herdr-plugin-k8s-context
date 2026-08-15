@@ -1,0 +1,146 @@
+# herdr-plugin-k8s-context
+
+Open Herdr tabs with isolated Kubernetes contexts and namespaces.
+
+The plugin opens a popup form for a tab name, kubeconfig context, and default namespace. It writes a private kubeconfig copy for the new tab and launches the tab with `KUBECONFIG` pointing at that copy. The source kubeconfig is never modified.
+
+## Requirements
+
+- Herdr 0.7.4 or later
+- Go 1.26 or later when installing from source
+- Linux or macOS
+
+`kubectl` is not required by the plugin itself. It is normally installed for use inside the resulting tab.
+
+## Install
+
+Install from GitHub:
+
+```sh
+herdr plugin install tkuchiki/herdr-plugin-k8s-context
+```
+
+For local development, build and link the checkout:
+
+```sh
+make link
+```
+
+## Use
+
+Invoke the action from a terminal:
+
+```sh
+herdr plugin action invoke open --plugin herdr.k8s-context
+```
+
+To assign a key, add an entry like this to the Herdr configuration:
+
+```toml
+[[keys.command]]
+key = "prefix+shift+c"
+type = "plugin_action"
+command = "herdr.k8s-context.open"
+description = "open Kubernetes context tab"
+```
+
+Reload the configuration after saving it:
+
+```sh
+herdr server reload-config
+```
+
+Press `Ctrl+B`, then `Shift+C` to open the popup. This complements Herdr's standard `Ctrl+B`, then lowercase `c` binding for creating a regular tab. Choose another unassigned key if `prefix+shift+c` is already used in your configuration.
+
+The popup contains three fields:
+
+- **Name**: required Herdr tab label, initially set to the number of tabs in the target workspace plus one, matching Herdr's default naming behavior.
+- **Context**: a context name, or `All contexts (keep current)`.
+- **Namespace**: an optional default namespace.
+
+Context and Namespace behave as follows:
+
+| Context | Namespace | Generated kubeconfig |
+| --- | --- | --- |
+| omitted | omitted | Keeps every context, namespace, and the original current context. |
+| omitted | specified | Keeps every context and changes only the current context's default namespace. |
+| specified | omitted | Keeps only the selected context and its referenced cluster/user. |
+| specified | specified | Keeps only the selected context and sets its default namespace. |
+
+When Context is omitted, the tab starts with the source kubeconfig's current context and can switch to any other copied context. When Context is specified, unrelated contexts are not present in that tab's kubeconfig.
+
+Namespace changes only the context's default namespace. Commands may still explicitly select another namespace.
+
+## Shell prompt integration
+
+Every tab created by the plugin exports `HERDR_K8S_CONTEXT=1` in addition to `KUBECONFIG`. Prompt tools can use this marker to show Kubernetes information only in plugin-created tabs. The marker contains no context or namespace value, so it cannot become stale; the prompt tool reads the tab's current `KUBECONFIG` whenever it renders.
+
+For [Starship](https://starship.rs/config/#kubernetes), add the following to `~/.config/starship.toml`:
+
+```toml
+[kubernetes]
+disabled = false
+detect_env_vars = ["HERDR_K8S_CONTEXT"]
+format = '[$symbol$context( \($namespace\))]($style) '
+```
+
+The symbol, style, context aliases, and displayed format remain configurable through Starship.
+
+For [kube-ps1](https://github.com/jonmosco/kube-ps1), install and source kube-ps1 as described in its documentation, then enable it conditionally in the shell startup file. For zsh:
+
+```zsh
+if [[ -n "${HERDR_K8S_CONTEXT:-}" ]]; then
+  PROMPT='$(kube_ps1)'$PROMPT
+fi
+```
+
+For bash, use the same condition with `PS1`:
+
+```bash
+if [[ -n "${HERDR_K8S_CONTEXT:-}" ]]; then
+  PS1='$(kube_ps1)'$PS1
+fi
+```
+
+These examples display changes made with commands such as `kubectl config use-context` or `kubectl config set-context --current --namespace=...` on the next prompt. The plugin does not modify `PS1`, `PROMPT`, or other shell configuration itself.
+
+## Kubeconfig loading and storage
+
+The plugin follows the standard Kubernetes loading rules:
+
+- If `KUBECONFIG` is set, all files in its path list are merged using client-go precedence rules.
+- Otherwise, the plugin loads `$HOME/.kube/config`.
+- Relative certificate and key references are resolved and inlined where client-go supports it.
+
+Generated files are stored below `HERDR_PLUGIN_STATE_DIR/kubeconfigs` with mode `0600`; the directory uses mode `0700`. File names do not contain the tab name, context, or namespace.
+
+The plugin records generated files by Herdr session and owning tabs. Closing a tab triggers a `tab.closed` plugin event, which removes that tab's ownership and deletes a kubeconfig when no owning tab remains. Exiting a tab's shell triggers a `pane.exited` event and reconciles all records with the live tab list. Exiting one pane in a tab that still has other panes does not remove the tab's kubeconfig.
+
+Moving a running pane to another tab triggers a `pane.moved` event. The destination becomes an additional owner before the source tab is cleaned up, so the moved process can continue using its original kubeconfig. Ownership is conservative when tabs contain panes from multiple isolated tabs: credentials are retained until every associated tab has closed rather than risking deletion while a moved process is still using them.
+
+A pending lifecycle record is written before credentials or a tab are created. If the popup is interrupted, the record is left alone for a five-minute grace period to avoid racing normal creation. The next reconciliation after that grace period compares the current tabs with the pre-creation snapshot. Newly observed tabs adopt the pending kubeconfig; when no new tab exists, the incomplete file is removed. Reconciliation runs on startup, popup invocation, and `pane.exited`; it is not scheduled by a background timer. If tab state cannot be confirmed, the file is retained rather than risking deletion of a kubeconfig that is still in use.
+
+Lifecycle updates use a per-session file lock. Lifecycle metadata from earlier development builds is migrated automatically.
+
+### Server restart limitation
+
+After a laptop or normal Herdr server restart, Herdr restores the workspace, tab, pane layout, and working directory, but the original shell process no longer exists. Herdr does not currently persist the custom `KUBECONFIG` or `HERDR_K8S_CONTEXT` environment values passed to `tab create`, so an ordinary restored shell does not automatically regain this plugin's Kubernetes isolation or prompt marker. This limitation was last verified with Herdr 0.7.5 and is covered by the release checklist.
+
+The generated kubeconfig is retained while the restored tab still exists and is deleted when that tab is closed. This conservative behavior also avoids breaking a live handoff whose original shell still uses the file. Reopen the plugin popup and create a new isolated tab when Kubernetes isolation is needed after a full server restart.
+
+## Development
+
+```sh
+make check
+make build
+make link
+make open
+```
+
+Run `make help` to list the available development and Herdr integration targets.
+
+Before publishing a release, follow the [release checklist](docs/release-checklist.md).
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

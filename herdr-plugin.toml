@@ -1,0 +1,38 @@
+id = "herdr.k8s-context"
+name = "Kubernetes Context Tab"
+version = "0.1.0"
+min_herdr_version = "0.7.4"
+description = "Open Herdr tabs with isolated Kubernetes contexts and namespaces."
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["go", "build", "-o", "herdr-plugin-k8s-context", "./cmd/herdr-plugin-k8s-context"]
+
+[[startup]]
+command = ["./herdr-plugin-k8s-context", "cleanup"]
+
+[[events]]
+on = "tab.closed"
+command = ["./herdr-plugin-k8s-context", "cleanup-tab"]
+
+[[events]]
+on = "pane.exited"
+command = ["./herdr-plugin-k8s-context", "cleanup"]
+
+[[events]]
+on = "pane.moved"
+command = ["./herdr-plugin-k8s-context", "move-pane"]
+
+[[actions]]
+id = "open"
+title = "Open Kubernetes context tab"
+contexts = ["workspace"]
+command = ["./herdr-plugin-k8s-context", "open"]
+
+[[panes]]
+id = "picker"
+title = "Kubernetes Context Tab"
+placement = "popup"
+width = "80%"
+height = "70%"
+command = ["./herdr-plugin-k8s-context", "picker"]
