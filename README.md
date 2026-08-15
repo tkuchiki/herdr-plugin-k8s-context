@@ -38,11 +38,19 @@ To assign a key, add an entry like this to the Herdr configuration:
 
 ```toml
 [[keys.command]]
-key = "prefix+k"
+key = "prefix+shift+c"
 type = "plugin_action"
 command = "herdr.k8s-context.open"
 description = "open Kubernetes context tab"
 ```
+
+Reload the configuration after saving it:
+
+```sh
+herdr server reload-config
+```
+
+Press `Ctrl+B`, then `Shift+C` to open the popup. This complements Herdr's standard `Ctrl+B`, then lowercase `c` binding for creating a regular tab. Choose another unassigned key if `prefix+shift+c` is already used in your configuration.
 
 The popup contains three fields:
 
