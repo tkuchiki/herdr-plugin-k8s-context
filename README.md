@@ -106,7 +106,9 @@ The plugin follows the standard Kubernetes loading rules:
 
 Generated files are stored below `HERDR_PLUGIN_STATE_DIR/kubeconfigs` with mode `0600`; the directory uses mode `0700`. File names do not contain the tab name, context, or namespace.
 
-The plugin records generated files by Herdr session and tab. Closing a tab triggers a `tab.closed` plugin event, which removes that tab's generated kubeconfig immediately. A startup hook and each later popup invocation also reconcile the records with Herdr's live tab list, covering missed events and interrupted cleanup. If tab state cannot be confirmed, the file is retained rather than risking deletion of a kubeconfig that is still in use.
+The plugin records generated files by Herdr session and tab. Closing a tab triggers a `tab.closed` plugin event, which removes that tab's generated kubeconfig immediately. Exiting a tab's shell triggers a `pane.exited` event and reconciles all records with the live tab list, removing the kubeconfig when that exit also removes the tab. Exiting one pane in a tab that still has other panes does not remove the tab's kubeconfig.
+
+A startup hook and each later popup invocation run the same reconciliation, covering missed events and interrupted cleanup. If tab state cannot be confirmed, the file is retained rather than risking deletion of a kubeconfig that is still in use.
 
 Lifecycle records are stored separately for each tab so concurrent event hooks cannot overwrite records for other tabs. Existing aggregate metadata from earlier development builds is migrated automatically.
 

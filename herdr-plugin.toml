@@ -15,6 +15,10 @@ command = ["./herdr-plugin-k8s-context", "cleanup"]
 on = "tab.closed"
 command = ["./herdr-plugin-k8s-context", "cleanup-tab"]
 
+[[events]]
+on = "pane.exited"
+command = ["./herdr-plugin-k8s-context", "cleanup"]
+
 [[actions]]
 id = "open"
 title = "Open Kubernetes context tab"

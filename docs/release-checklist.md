@@ -225,14 +225,18 @@ Before closing one generated tab, record its kubeconfig path:
 printf '%s\n' "$KUBECONFIG" >/tmp/generated-kubeconfig-path
 ```
 
-Close that tab through Herdr. From another tab, verify immediate cleanup:
+Run `exit` in that tab. From another tab, verify immediate cleanup:
 
 ```sh
 test ! -e "$(cat /tmp/generated-kubeconfig-path)"
 herdr plugin log list --plugin herdr.k8s-context --limit 20
 ```
 
-There must be no failed `cleanup-tab` command log.
+There must be no failed `cleanup` or `cleanup-tab` command log.
+
+Repeat the test by creating another plugin tab and closing it through Herdr rather than exiting its shell. Both `exit` and an explicit tab close must remove the generated kubeconfig. The plugin log should show a successful `cleanup` event hook for `pane.exited` or a successful `cleanup-tab` hook for `tab.closed`, respectively.
+
+Finally, split a plugin tab into two panes and run `exit` in only one pane. Confirm that the tab still exists and its generated kubeconfig is not removed.
 
 ## 8. Verify known restart behavior
 
@@ -267,7 +271,8 @@ The release candidate is ready to merge only when all of the following are true:
 - [ ] All four context/namespace combinations behave as documented.
 - [ ] Generated kubeconfigs use mode `600` and do not modify the source kubeconfig.
 - [ ] Tabs use independent kubeconfig files.
-- [ ] Closing a tab removes its generated kubeconfig without cleanup errors.
+- [ ] Shell exit and explicit tab close remove generated kubeconfigs without cleanup errors.
+- [ ] Exiting one pane in a multi-pane tab does not remove the tab's kubeconfig.
 - [ ] Restart behavior matches the documented limitation.
 - [ ] `herdr-plugin.toml`, README requirements, and the intended tag use the same release version.
 - [ ] The repository description, Apache-2.0 license, and `herdr-plugin` GitHub topic are present.
