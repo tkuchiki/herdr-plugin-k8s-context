@@ -73,6 +73,7 @@ docker run --rm -it \
   --name herdr-plugin-release-test \
   --hostname release-test \
   -e TERM=xterm-256color \
+  -e RELEASE_REF="$RELEASE_REF" \
   golang:1.26.5-bookworm \
   bash
 ```
@@ -117,13 +118,13 @@ Install the plugin directly from the GitHub release candidate ref:
 ```sh
 herdr plugin install \
   tkuchiki/herdr-plugin-k8s-context \
-  --ref codex/initial-release \
+  --ref "$RELEASE_REF" \
   --yes
 
 herdr plugin list --plugin herdr.k8s-context
 ```
 
-For later releases, replace `codex/initial-release` with the release candidate branch or commit being tested.
+`RELEASE_REF` is passed into the container by the `docker run` command above, so this installs the same branch or commit that passed the local checks.
 
 ## 5. Create an offline kubeconfig fixture
 
@@ -238,6 +239,16 @@ Repeat the test by creating another plugin tab and closing it through Herdr rath
 
 Finally, split a plugin tab into two panes and run `exit` in only one pane. Confirm that the tab still exists and its generated kubeconfig is not removed.
 
+Create another plugin tab, then move its running pane to a different tab or workspace:
+
+```sh
+herdr pane move "$HERDR_PANE_ID" --new-tab --focus
+```
+
+Close the original tab if it still exists. In the moved pane, confirm that `$KUBECONFIG` still exists and `kubectl config current-context` still succeeds. Close the destination tab and confirm that the generated kubeconfig is then removed. The plugin log should contain a successful `move-pane` hook for `pane.moved`.
+
+For interrupted-creation recovery, the automated state tests cover both outcomes: adoption by a tab created after the recorded baseline and removal when no new tab exists. Run `make test` and confirm that the pending lifecycle tests pass. The five-minute grace period is evaluated by the next reconciliation rather than a background timer and does not need to be exercised manually for every release.
+
 ## 8. Verify known restart behavior
 
 Create a plugin tab and record its generated kubeconfig path:
@@ -273,6 +284,8 @@ The release candidate is ready to merge only when all of the following are true:
 - [ ] Tabs use independent kubeconfig files.
 - [ ] Shell exit and explicit tab close remove generated kubeconfigs without cleanup errors.
 - [ ] Exiting one pane in a multi-pane tab does not remove the tab's kubeconfig.
+- [ ] Moving a pane to another tab retains its kubeconfig until every owning tab closes.
+- [ ] Automated interrupted-creation recovery tests pass.
 - [ ] Restart behavior matches the documented limitation.
 - [ ] `herdr-plugin.toml`, README requirements, and the intended tag use the same release version.
 - [ ] The repository description, Apache-2.0 license, and `herdr-plugin` GitHub topic are present.

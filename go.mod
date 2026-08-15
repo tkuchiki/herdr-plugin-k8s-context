@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	charm.land/huh/v2 v2.0.3
+	golang.org/x/sys v0.42.0
 	k8s.io/client-go v0.36.3
 )
 
@@ -43,7 +44,6 @@ require (
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/term v0.39.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/time v0.14.0 // indirect

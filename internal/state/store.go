@@ -8,168 +8,419 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"time"
+
+	"github.com/tkuchiki/herdr-plugin-k8s-context/internal/securefile"
+	"golang.org/x/sys/unix"
 )
 
-type Entry struct {
-	TabID string `json:"tab_id"`
-	Path  string `json:"path"`
+const pendingGracePeriod = 5 * time.Minute
+
+type record struct {
+	Path    string         `json:"path"`
+	Owners  []string       `json:"owners,omitempty"`
+	Pending *pendingRecord `json:"pending,omitempty"`
 }
 
-// metadata is the legacy aggregate format. It is retained only for migration.
-type metadata struct {
-	Entries []Entry `json:"entries"`
+type pendingRecord struct {
+	SinceUnix      int64    `json:"since_unix"`
+	BaselineTabIDs []string `json:"baseline_tab_ids"`
+}
+
+// legacyRecord supports aggregate, per-tab, and earlier path-keyed development
+// formats.
+type legacyRecord struct {
+	TabID          string   `json:"tab_id,omitempty"`
+	TabIDs         []string `json:"tab_ids,omitempty"`
+	Path           string   `json:"path"`
+	PendingSince   int64    `json:"pending_since_unix,omitempty"`
+	BaselineTabIDs []string `json:"baseline_tab_ids,omitempty"`
+}
+
+type legacyMetadata struct {
+	Entries []legacyRecord `json:"entries"`
 }
 
 type Store struct {
 	stateDir   string
 	socketPath string
+	now        func() time.Time
 }
 
 func New(stateDir, socketPath string) Store {
-	return Store{stateDir: stateDir, socketPath: socketPath}
+	return Store{stateDir: stateDir, socketPath: socketPath, now: time.Now}
 }
 
-func (s Store) Add(entry Entry) error {
-	if entry.TabID == "" || entry.Path == "" {
-		return errors.New("record kubeconfig: tab ID and path are required")
+// BeginCreation records a generated path before the kubeconfig and its Herdr
+// tab are created. The baseline permits recovery after an interrupted create.
+func (s Store) BeginCreation(path string, baseline map[string]struct{}) error {
+	if path == "" {
+		return errors.New("begin kubeconfig lifecycle: path is required")
 	}
-	if !s.owns(entry.Path) {
-		return errors.New("record kubeconfig: path is outside the managed kubeconfig directory")
+	if baseline == nil {
+		return errors.New("begin kubeconfig lifecycle: baseline tab set is nil")
 	}
-	if err := s.migrateLegacy(); err != nil {
-		return err
+	if !s.owns(path) {
+		return errors.New("begin kubeconfig lifecycle: path is outside the managed kubeconfig directory")
 	}
-	return s.writeRecord(entry)
+	return s.withLock(func() error {
+		records, err := s.loadRecords()
+		if err != nil {
+			return err
+		}
+		if _, ok := records[path]; ok {
+			return errors.New("begin kubeconfig lifecycle: path is already recorded")
+		}
+		return s.writeRecord(record{
+			Path: path,
+			Pending: &pendingRecord{
+				SinceUnix:      s.now().Unix(),
+				BaselineTabIDs: sortedKeys(baseline),
+			},
+		})
+	})
 }
 
-// RemoveTab removes the managed kubeconfig and lifecycle record for tabID.
-// It is idempotent so duplicate tab.closed events are harmless.
+// CommitCreation replaces a pending record with ownership by the created tab.
+func (s Store) CommitCreation(path, tabID string) error {
+	if path == "" || tabID == "" {
+		return errors.New("commit kubeconfig lifecycle: path and tab ID are required")
+	}
+	return s.withLock(func() error {
+		records, err := s.loadRecords()
+		if err != nil {
+			return err
+		}
+		record, ok := records[path]
+		if !ok || record.Pending == nil {
+			return errors.New("commit kubeconfig lifecycle: pending record does not exist")
+		}
+		record.Pending = nil
+		record.Owners = []string{tabID}
+		return s.writeRecord(record)
+	})
+}
+
+// AbortCreation removes an incomplete managed kubeconfig and its record.
+func (s Store) AbortCreation(path string) error {
+	if path == "" {
+		return errors.New("abort kubeconfig lifecycle: path is required")
+	}
+	return s.withLock(func() error {
+		records, err := s.loadRecords()
+		if err != nil {
+			return err
+		}
+		if record, ok := records[path]; ok {
+			return s.removeRecord(record)
+		}
+		if !s.owns(path) {
+			return errors.New("abort kubeconfig lifecycle: path is outside the managed directory")
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("abort kubeconfig lifecycle: %w", err)
+		}
+		return nil
+	})
+}
+
+// RetainForMovedPane makes destinationTabID an additional owner of every
+// kubeconfig owned by sourceTabID. Keeping the source owner is intentional: a
+// source tab can still contain other panes using the same kubeconfig.
+func (s Store) RetainForMovedPane(sourceTabID, destinationTabID string) error {
+	if sourceTabID == "" || destinationTabID == "" {
+		return errors.New("move kubeconfig lifecycle: source and destination tab IDs are required")
+	}
+	if sourceTabID == destinationTabID {
+		return nil
+	}
+	return s.withLock(func() error {
+		records, err := s.loadRecords()
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			if !contains(record.Owners, sourceTabID) {
+				continue
+			}
+			record.Owners = appendUnique(record.Owners, destinationTabID)
+			if err := s.writeRecord(record); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// RemoveTab drops tabID from every record and removes kubeconfigs that no
+// longer have an owning tab. It is idempotent for duplicate tab.closed events.
 func (s Store) RemoveTab(tabID string) error {
 	if tabID == "" {
 		return errors.New("remove kubeconfig: tab ID is required")
 	}
-	if err := s.migrateLegacy(); err != nil {
-		return err
-	}
-	recordPath := s.recordPath(tabID)
-	entry, err := readRecord(recordPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if entry.TabID != tabID {
-		return fmt.Errorf("remove kubeconfig: lifecycle record does not match tab %q", tabID)
-	}
-	return s.removeRecord(recordPath, entry)
+	return s.withLock(func() error {
+		records, err := s.loadRecords()
+		if err != nil {
+			return err
+		}
+		var removeErrors []error
+		for _, record := range records {
+			owners := removeValue(record.Owners, tabID)
+			if len(owners) == len(record.Owners) {
+				continue
+			}
+			if len(owners) == 0 {
+				if err := s.removeRecord(record); err != nil {
+					removeErrors = append(removeErrors, err)
+				}
+				continue
+			}
+			record.Owners = owners
+			if err := s.writeRecord(record); err != nil {
+				removeErrors = append(removeErrors, err)
+			}
+		}
+		return errors.Join(removeErrors...)
+	})
 }
 
-// Cleanup removes only files recorded for this Herdr session whose tab IDs
-// are proven absent from the live tab set.
+// Cleanup reconciles active records with the live tab set. Pending records are
+// left alone briefly so normal tab creation and event hooks cannot race. Once
+// old enough, tabs absent from the recorded baseline are adopted as owners; if
+// there are none, the interrupted kubeconfig is removed.
 func (s Store) Cleanup(live map[string]struct{}) error {
 	if live == nil {
 		return errors.New("cleanup kubeconfigs: live tab set is nil")
 	}
-	if err := s.migrateLegacy(); err != nil {
-		return err
-	}
-	records, recordErrors := s.records()
-	var cleanupErrors []error
-	if recordErrors != nil {
-		cleanupErrors = append(cleanupErrors, recordErrors)
-	}
-	for recordPath, entry := range records {
-		if _, ok := live[entry.TabID]; ok {
-			continue
+	return s.withLock(func() error {
+		records, loadErr := s.loadRecords()
+		var cleanupErrors []error
+		if loadErr != nil {
+			cleanupErrors = append(cleanupErrors, loadErr)
 		}
-		if err := s.removeRecord(recordPath, entry); err != nil {
-			cleanupErrors = append(cleanupErrors, err)
+		for _, record := range records {
+			if record.Pending != nil {
+				if s.now().Sub(time.Unix(record.Pending.SinceUnix, 0)) < pendingGracePeriod {
+					continue
+				}
+				owners := difference(live, record.Pending.BaselineTabIDs)
+				if len(owners) == 0 {
+					if err := s.removeRecord(record); err != nil {
+						cleanupErrors = append(cleanupErrors, err)
+					}
+					continue
+				}
+				record.Pending = nil
+				record.Owners = owners
+				if err := s.writeRecord(record); err != nil {
+					cleanupErrors = append(cleanupErrors, err)
+				}
+				continue
+			}
+
+			owners := intersect(record.Owners, live)
+			if len(owners) == 0 {
+				if err := s.removeRecord(record); err != nil {
+					cleanupErrors = append(cleanupErrors, err)
+				}
+				continue
+			}
+			if len(owners) != len(record.Owners) {
+				record.Owners = owners
+				if err := s.writeRecord(record); err != nil {
+					cleanupErrors = append(cleanupErrors, err)
+				}
+			}
 		}
-	}
-	return errors.Join(cleanupErrors...)
+		return errors.Join(cleanupErrors...)
+	})
 }
 
-func (s Store) records() (map[string]Entry, error) {
-	result := make(map[string]Entry)
-	var recordErrors []error
-	items, err := os.ReadDir(s.sessionDir())
-	if errors.Is(err, os.ErrNotExist) {
-		return result, nil
+func (s Store) withLock(operation func() error) (err error) {
+	if err := s.ensureDirs(); err != nil {
+		return err
 	}
+	lock, err := os.OpenFile(filepath.Join(s.sessionDir(), ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("open lifecycle lock: %w", err)
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("close lifecycle lock: %w", closeErr)
+		}
+	}()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		return fmt.Errorf("lock lifecycle state: %w", err)
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN) //nolint:errcheck
+	if err := s.migrateAggregateMetadata(); err != nil {
+		return err
+	}
+	return operation()
+}
+
+func (s Store) loadRecords() (map[string]record, error) {
+	items, err := os.ReadDir(s.sessionDir())
 	if err != nil {
 		return nil, fmt.Errorf("read lifecycle directory: %w", err)
 	}
+
+	records := make(map[string]record)
+	legacyPaths := make(map[string]string)
+	var recordErrors []error
 	for _, item := range items {
 		if item.IsDir() || filepath.Ext(item.Name()) != ".json" {
 			continue
 		}
 		path := filepath.Join(s.sessionDir(), item.Name())
-		entry, err := readRecord(path)
+		record, legacyTabID, legacy, err := readStoredRecord(path)
 		if err != nil {
 			recordErrors = append(recordErrors, err)
 			continue
 		}
-		if path != s.recordPath(entry.TabID) {
-			recordErrors = append(recordErrors, fmt.Errorf("read lifecycle record %q: tab ID hash does not match filename", path))
+		if !s.owns(record.Path) {
+			recordErrors = append(recordErrors, fmt.Errorf("read lifecycle record %q: path is outside the managed directory", path))
 			continue
 		}
-		result[path] = entry
+		expected := s.recordPath(record.Path)
+		legacyFilename := legacy && legacyTabID != "" && path == s.legacyRecordPath(legacyTabID)
+		if path != expected && !legacyFilename {
+			recordErrors = append(recordErrors, fmt.Errorf("read lifecycle record %q: path hash does not match filename", path))
+			continue
+		}
+
+		merged, err := mergeRecords(records[record.Path], record)
+		if err != nil {
+			recordErrors = append(recordErrors, fmt.Errorf("merge lifecycle record %q: %w", path, err))
+			continue
+		}
+		records[record.Path] = merged
+		if legacy {
+			legacyPaths[path] = record.Path
+		}
 	}
-	return result, errors.Join(recordErrors...)
+
+	for path, configPath := range legacyPaths {
+		record := records[configPath]
+		if err := s.writeRecord(record); err != nil {
+			recordErrors = append(recordErrors, err)
+			continue
+		}
+		if path != s.recordPath(record.Path) {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				recordErrors = append(recordErrors, fmt.Errorf("remove legacy lifecycle record %q: %w", path, err))
+			}
+		}
+	}
+	return records, errors.Join(recordErrors...)
 }
 
-func (s Store) writeRecord(entry Entry) error {
-	if err := s.ensureDirs(); err != nil {
-		return err
+func (s Store) writeRecord(record record) error {
+	if err := validateRecord(record); err != nil {
+		return fmt.Errorf("record kubeconfig: %w", err)
 	}
-	path := s.recordPath(entry.TabID)
-	existing, err := readRecord(path)
-	if err == nil {
-		if existing == entry {
-			return nil
-		}
-		return fmt.Errorf("record kubeconfig: tab %q already has a different lifecycle record", entry.TabID)
+	if !s.owns(record.Path) {
+		return errors.New("record kubeconfig: path is outside the managed kubeconfig directory")
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	contents, err := json.MarshalIndent(entry, "", "  ")
+	record.Owners = uniqueSorted(record.Owners)
+	contents, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode lifecycle record: %w", err)
 	}
-	return writeAtomic(path, contents)
-}
-
-func readRecord(path string) (Entry, error) {
-	var entry Entry
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		return entry, err
-	}
-	if err := json.Unmarshal(contents, &entry); err != nil {
-		return entry, fmt.Errorf("parse lifecycle record %q: %w", path, err)
-	}
-	if entry.TabID == "" || entry.Path == "" {
-		return entry, fmt.Errorf("parse lifecycle record %q: tab ID and path are required", path)
-	}
-	return entry, nil
-}
-
-func (s Store) removeRecord(recordPath string, entry Entry) error {
-	if !s.owns(entry.Path) {
-		return fmt.Errorf("remove kubeconfig for tab %q: path is outside the managed directory", entry.TabID)
-	}
-	if err := os.Remove(entry.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove kubeconfig for tab %q: %w", entry.TabID, err)
-	}
-	if err := os.Remove(recordPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove lifecycle record for tab %q: %w", entry.TabID, err)
+	if err := securefile.WriteAtomic(s.recordPath(record.Path), ".record-*.tmp", contents); err != nil {
+		return fmt.Errorf("write lifecycle record: %w", err)
 	}
 	return nil
 }
 
-func (s Store) migrateLegacy() error {
+func readStoredRecord(path string) (record, string, bool, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return record{}, "", false, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(contents, &fields); err != nil {
+		return record{}, "", false, fmt.Errorf("parse lifecycle record %q: %w", path, err)
+	}
+	if _, hasOwners := fields["owners"]; hasOwners || fields["pending"] != nil {
+		var current record
+		if err := json.Unmarshal(contents, &current); err != nil {
+			return record{}, "", false, fmt.Errorf("parse lifecycle record %q: %w", path, err)
+		}
+		if err := validateRecord(current); err != nil {
+			return record{}, "", false, fmt.Errorf("parse lifecycle record %q: %w", path, err)
+		}
+		return current, "", false, nil
+	}
+
+	var legacy legacyRecord
+	if err := json.Unmarshal(contents, &legacy); err != nil {
+		return record{}, "", false, fmt.Errorf("parse legacy lifecycle record %q: %w", path, err)
+	}
+	converted, err := convertLegacyRecord(legacy)
+	if err != nil {
+		return record{}, "", false, fmt.Errorf("parse legacy lifecycle record %q: %w", path, err)
+	}
+	return converted, legacy.TabID, true, nil
+}
+
+func convertLegacyRecord(legacy legacyRecord) (record, error) {
+	owners := appendUnique(legacy.TabIDs, legacy.TabID)
+	pending := legacy.PendingSince != 0
+	if legacy.Path == "" || (pending == (len(owners) > 0)) {
+		return record{}, errors.New("path and exactly one lifecycle state are required")
+	}
+	record := record{Path: legacy.Path, Owners: owners}
+	if pending {
+		record.Pending = &pendingRecord{
+			SinceUnix:      legacy.PendingSince,
+			BaselineTabIDs: uniqueSorted(legacy.BaselineTabIDs),
+		}
+	}
+	return record, nil
+}
+
+func validateRecord(record record) error {
+	active := len(record.Owners) > 0
+	pending := record.Pending != nil
+	if record.Path == "" || active == pending {
+		return errors.New("path and exactly one lifecycle state are required")
+	}
+	if pending && record.Pending.SinceUnix == 0 {
+		return errors.New("pending creation time is required")
+	}
+	return nil
+}
+
+func mergeRecords(existing, incoming record) (record, error) {
+	if existing.Path == "" {
+		return incoming, nil
+	}
+	if existing.Path != incoming.Path {
+		return record{}, errors.New("kubeconfig paths do not match")
+	}
+	if existing.Pending != nil || incoming.Pending != nil {
+		return record{}, errors.New("duplicate records include a pending lifecycle")
+	}
+	existing.Owners = appendUnique(existing.Owners, incoming.Owners...)
+	return existing, nil
+}
+
+func (s Store) removeRecord(record record) error {
+	if !s.owns(record.Path) {
+		return fmt.Errorf("remove kubeconfig %q: path is outside the managed directory", record.Path)
+	}
+	if err := os.Remove(record.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove kubeconfig %q: %w", record.Path, err)
+	}
+	if err := os.Remove(s.recordPath(record.Path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove lifecycle record for %q: %w", record.Path, err)
+	}
+	return nil
+}
+
+func (s Store) migrateAggregateMetadata() error {
 	contents, err := os.ReadFile(s.legacyPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -177,15 +428,32 @@ func (s Store) migrateLegacy() error {
 	if err != nil {
 		return fmt.Errorf("read legacy state metadata: %w", err)
 	}
-	var data metadata
-	if err := json.Unmarshal(contents, &data); err != nil {
+	var metadata legacyMetadata
+	if err := json.Unmarshal(contents, &metadata); err != nil {
 		return fmt.Errorf("parse legacy state metadata: %w", err)
 	}
-	for _, entry := range data.Entries {
-		if entry.TabID == "" || entry.Path == "" {
-			return errors.New("migrate legacy state metadata: tab ID and path are required")
+	records := make(map[string]record)
+	for _, legacy := range metadata.Entries {
+		record, err := convertLegacyRecord(legacy)
+		if err != nil {
+			return fmt.Errorf("migrate legacy state metadata: %w", err)
 		}
-		if err := s.writeRecord(entry); err != nil {
+		merged, err := mergeRecords(records[record.Path], record)
+		if err != nil {
+			return fmt.Errorf("migrate legacy state metadata: %w", err)
+		}
+		records[record.Path] = merged
+	}
+	for path, record := range records {
+		if existing, _, _, err := readStoredRecord(s.recordPath(path)); err == nil {
+			record, err = mergeRecords(existing, record)
+			if err != nil {
+				return fmt.Errorf("migrate legacy state metadata: %w", err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("migrate legacy state metadata: %w", err)
+		}
+		if err := s.writeRecord(record); err != nil {
 			return fmt.Errorf("migrate legacy state metadata: %w", err)
 		}
 	}
@@ -210,36 +478,6 @@ func (s Store) ensureDirs() error {
 	return nil
 }
 
-func writeAtomic(path string, contents []byte) (err error) {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".record-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create lifecycle record: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		if err != nil {
-			_ = tmp.Close()
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	if err = tmp.Chmod(0o600); err != nil {
-		return fmt.Errorf("secure lifecycle record: %w", err)
-	}
-	if _, err = tmp.Write(contents); err != nil {
-		return fmt.Errorf("write lifecycle record: %w", err)
-	}
-	if err = tmp.Sync(); err != nil {
-		return fmt.Errorf("sync lifecycle record: %w", err)
-	}
-	if err = tmp.Close(); err != nil {
-		return fmt.Errorf("close lifecycle record: %w", err)
-	}
-	if err = os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("install lifecycle record: %w", err)
-	}
-	return os.Chmod(path, 0o600)
-}
-
 func (s Store) owns(path string) bool {
 	root, err := filepath.Abs(filepath.Join(s.stateDir, "kubeconfigs"))
 	if err != nil {
@@ -256,12 +494,90 @@ func (s Store) sessionDir() string {
 	return filepath.Join(s.stateDir, "lifecycle", hashName(s.socketPath))
 }
 
-func (s Store) recordPath(tabID string) string {
+func (s Store) recordPath(path string) string {
+	return filepath.Join(s.sessionDir(), hashName(path)+".json")
+}
+
+func (s Store) legacyRecordPath(tabID string) string {
 	return filepath.Join(s.sessionDir(), hashName(tabID)+".json")
 }
 
 func (s Store) legacyPath() string {
 	return filepath.Join(s.stateDir, "tabs-"+hashName(s.socketPath)+".json")
+}
+
+func appendUnique(values []string, additions ...string) []string {
+	return uniqueSorted(append(append([]string(nil), values...), additions...))
+}
+
+func uniqueSorted(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func sortedKeys(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func removeValue(values []string, target string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != target {
+			result = append(result, value)
+		}
+	}
+	return uniqueSorted(result)
+}
+
+func intersect(values []string, set map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := set[value]; ok {
+			result = append(result, value)
+		}
+	}
+	return uniqueSorted(result)
+}
+
+func difference(values map[string]struct{}, baseline []string) []string {
+	base := make(map[string]struct{}, len(baseline))
+	for _, value := range baseline {
+		base[value] = struct{}{}
+	}
+	result := make([]string, 0, len(values))
+	for value := range values {
+		if _, ok := base[value]; !ok {
+			result = append(result, value)
+		}
+	}
+	sort.Strings(result)
+	return result
 }
 
 func hashName(value string) string {

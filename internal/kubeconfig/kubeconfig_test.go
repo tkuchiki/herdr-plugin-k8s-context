@@ -169,9 +169,13 @@ contexts:
 
 func TestWriteUsesPrivatePermissions(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "state")
-	path, err := Write(stateDir, testConfig())
+	path, err := ReservePath(stateDir)
 	if err != nil {
-		t.Fatalf("Write() error = %v", err)
+		t.Fatalf("ReservePath() error = %v", err)
+	}
+	err = WriteToPath(path, testConfig())
+	if err != nil {
+		t.Fatalf("WriteToPath() error = %v", err)
 	}
 	info, err := os.Stat(path)
 	if err != nil {

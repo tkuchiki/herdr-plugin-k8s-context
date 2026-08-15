@@ -94,27 +94,76 @@ func (e Environment) ValidateLifecycle() error {
 	return nil
 }
 
-func ClosedTabID(eventName, raw string) (string, error) {
-	if eventName != "tab.closed" {
-		return "", fmt.Errorf("cleanup tab: unexpected plugin event %q", eventName)
+func ParseClosedTabID(eventName, raw string) (string, error) {
+	event, err := decodePluginEvent[tabClosedEvent](eventName, raw, "tab.closed", "cleanup tab")
+	if err != nil {
+		return "", err
 	}
-	if raw == "" {
-		return "", errors.New("cleanup tab: HERDR_PLUGIN_EVENT_JSON is empty")
+	if event.Type != "" && event.Type != "tab_closed" && event.Type != "tab.closed" {
+		return "", fmt.Errorf("cleanup tab: event data contains unexpected type %q", event.Type)
 	}
-	var value any
-	if err := json.Unmarshal([]byte(raw), &value); err != nil {
-		return "", fmt.Errorf("cleanup tab: parse event JSON: %w", err)
-	}
-	if object, ok := value.(map[string]any); ok {
-		if event, ok := object["event"].(string); ok && event != "tab_closed" && event != "tab.closed" {
-			return "", fmt.Errorf("cleanup tab: event JSON contains unexpected event %q", event)
-		}
-	}
-	id := findStringKey(value, "tab_id")
-	if id == "" {
+	if event.TabID == "" {
 		return "", errors.New("cleanup tab: event JSON contains no tab ID")
 	}
-	return id, nil
+	return event.TabID, nil
+}
+
+func ParseMovedPaneTabs(eventName, raw string) (string, string, error) {
+	event, err := decodePluginEvent[paneMovedEvent](eventName, raw, "pane.moved", "move pane lifecycle")
+	if err != nil {
+		return "", "", err
+	}
+	if event.Type != "" && event.Type != "pane_moved" && event.Type != "pane.moved" {
+		return "", "", fmt.Errorf("move pane lifecycle: event data contains unexpected type %q", event.Type)
+	}
+	if event.PreviousTabID == "" || event.Pane.TabID == "" {
+		return "", "", errors.New("move pane lifecycle: event JSON contains incomplete tab IDs")
+	}
+	return event.PreviousTabID, event.Pane.TabID, nil
+}
+
+type pluginEventEnvelope struct {
+	Event string          `json:"event"`
+	Data  json.RawMessage `json:"data"`
+}
+
+type tabClosedEvent struct {
+	Type  string `json:"type"`
+	TabID string `json:"tab_id"`
+}
+
+type paneMovedEvent struct {
+	Type          string `json:"type"`
+	PreviousTabID string `json:"previous_tab_id"`
+	Pane          struct {
+		TabID string `json:"tab_id"`
+	} `json:"pane"`
+}
+
+func decodePluginEvent[T any](eventName, raw, expectedEvent, operation string) (T, error) {
+	var result T
+	if eventName != expectedEvent {
+		return result, fmt.Errorf("%s: unexpected plugin event %q", operation, eventName)
+	}
+	if raw == "" {
+		return result, fmt.Errorf("%s: HERDR_PLUGIN_EVENT_JSON is empty", operation)
+	}
+	var envelope pluginEventEnvelope
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		return result, fmt.Errorf("%s: parse event JSON: %w", operation, err)
+	}
+	legacyEvent := strings.ReplaceAll(expectedEvent, ".", "_")
+	if envelope.Event != "" && envelope.Event != expectedEvent && envelope.Event != legacyEvent {
+		return result, fmt.Errorf("%s: event JSON contains unexpected event %q", operation, envelope.Event)
+	}
+	payload := envelope.Data
+	if len(payload) == 0 {
+		payload = json.RawMessage(raw)
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		return result, fmt.Errorf("%s: parse event data: %w", operation, err)
+	}
+	return result, nil
 }
 
 type Client struct {

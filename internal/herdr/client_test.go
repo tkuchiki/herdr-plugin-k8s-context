@@ -163,18 +163,18 @@ func TestValidateLifecycleDoesNotRequireWorkspace(t *testing.T) {
 	}
 }
 
-func TestClosedTabID(t *testing.T) {
+func TestParseClosedTabID(t *testing.T) {
 	raw := `{"event":"tab_closed","data":{"type":"tab_closed","tab_id":"w1:t2","workspace_id":"w1"}}`
-	id, err := ClosedTabID("tab.closed", raw)
+	id, err := ParseClosedTabID("tab.closed", raw)
 	if err != nil {
-		t.Fatalf("ClosedTabID() error = %v", err)
+		t.Fatalf("ParseClosedTabID() error = %v", err)
 	}
 	if id != "w1:t2" {
-		t.Fatalf("ClosedTabID() = %q, want w1:t2", id)
+		t.Fatalf("ParseClosedTabID() = %q, want w1:t2", id)
 	}
 }
 
-func TestClosedTabIDRejectsUnexpectedEvent(t *testing.T) {
+func TestParseClosedTabIDRejectsUnexpectedEvent(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		raw  string
@@ -184,8 +184,35 @@ func TestClosedTabIDRejectsUnexpectedEvent(t *testing.T) {
 		{name: "tab.closed", raw: `{"event":"tab_closed","data":{}}`},
 		{name: "tab.closed", raw: `{`},
 	} {
-		if _, err := ClosedTabID(test.name, test.raw); err == nil {
-			t.Errorf("ClosedTabID(%q, %q) error = nil", test.name, test.raw)
+		if _, err := ParseClosedTabID(test.name, test.raw); err == nil {
+			t.Errorf("ParseClosedTabID(%q, %q) error = nil", test.name, test.raw)
+		}
+	}
+}
+
+func TestParseMovedPaneTabs(t *testing.T) {
+	raw := `{"event":"pane_moved","data":{"type":"pane_moved","previous_pane_id":"w1:p1","previous_workspace_id":"w1","previous_tab_id":"w1:t1","pane":{"pane_id":"w2:p2","workspace_id":"w2","tab_id":"w2:t3"}}}`
+	previous, destination, err := ParseMovedPaneTabs("pane.moved", raw)
+	if err != nil {
+		t.Fatalf("ParseMovedPaneTabs() error = %v", err)
+	}
+	if previous != "w1:t1" || destination != "w2:t3" {
+		t.Fatalf("ParseMovedPaneTabs() = %q, %q, want w1:t1, w2:t3", previous, destination)
+	}
+}
+
+func TestParseMovedPaneTabsRejectsIncompleteEvent(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "tab.moved", raw: `{"data":{"previous_tab_id":"w1:t1","pane":{"tab_id":"w1:t2"}}}`},
+		{name: "pane.moved", raw: `{"event":"pane_created","data":{}}`},
+		{name: "pane.moved", raw: `{"event":"pane_moved","data":{"previous_tab_id":"w1:t1"}}`},
+		{name: "pane.moved", raw: `{`},
+	} {
+		if _, _, err := ParseMovedPaneTabs(test.name, test.raw); err == nil {
+			t.Errorf("ParseMovedPaneTabs(%q, %q) error = nil", test.name, test.raw)
 		}
 	}
 }

@@ -2,7 +2,7 @@
 
 Open Herdr tabs with isolated Kubernetes contexts and namespaces.
 
-The plugin opens a popup form for a tab name, kubeconfig context, and default namespace. It writes a private, self-contained kubeconfig for the new tab and launches the tab with `KUBECONFIG` pointing at that copy. The source kubeconfig is never modified.
+The plugin opens a popup form for a tab name, kubeconfig context, and default namespace. It writes a private kubeconfig copy for the new tab and launches the tab with `KUBECONFIG` pointing at that copy. The source kubeconfig is never modified.
 
 ## Requirements
 
@@ -114,15 +114,17 @@ The plugin follows the standard Kubernetes loading rules:
 
 Generated files are stored below `HERDR_PLUGIN_STATE_DIR/kubeconfigs` with mode `0600`; the directory uses mode `0700`. File names do not contain the tab name, context, or namespace.
 
-The plugin records generated files by Herdr session and tab. Closing a tab triggers a `tab.closed` plugin event, which removes that tab's generated kubeconfig immediately. Exiting a tab's shell triggers a `pane.exited` event and reconciles all records with the live tab list, removing the kubeconfig when that exit also removes the tab. Exiting one pane in a tab that still has other panes does not remove the tab's kubeconfig.
+The plugin records generated files by Herdr session and owning tabs. Closing a tab triggers a `tab.closed` plugin event, which removes that tab's ownership and deletes a kubeconfig when no owning tab remains. Exiting a tab's shell triggers a `pane.exited` event and reconciles all records with the live tab list. Exiting one pane in a tab that still has other panes does not remove the tab's kubeconfig.
 
-A startup hook and each later popup invocation run the same reconciliation, covering missed events and interrupted cleanup. If tab state cannot be confirmed, the file is retained rather than risking deletion of a kubeconfig that is still in use.
+Moving a running pane to another tab triggers a `pane.moved` event. The destination becomes an additional owner before the source tab is cleaned up, so the moved process can continue using its original kubeconfig. Ownership is conservative when tabs contain panes from multiple isolated tabs: credentials are retained until every associated tab has closed rather than risking deletion while a moved process is still using them.
 
-Lifecycle records are stored separately for each tab so concurrent event hooks cannot overwrite records for other tabs. Existing aggregate metadata from earlier development builds is migrated automatically.
+A pending lifecycle record is written before credentials or a tab are created. If the popup is interrupted, the record is left alone for a five-minute grace period to avoid racing normal creation. The next reconciliation after that grace period compares the current tabs with the pre-creation snapshot. Newly observed tabs adopt the pending kubeconfig; when no new tab exists, the incomplete file is removed. Reconciliation runs on startup, popup invocation, and `pane.exited`; it is not scheduled by a background timer. If tab state cannot be confirmed, the file is retained rather than risking deletion of a kubeconfig that is still in use.
+
+Lifecycle updates use a per-session file lock. Lifecycle metadata from earlier development builds is migrated automatically.
 
 ### Server restart limitation
 
-After a laptop or normal Herdr server restart, Herdr restores the workspace, tab, pane layout, and working directory, but the original shell process no longer exists. Herdr 0.7.5 does not persist the custom `KUBECONFIG` or `HERDR_K8S_CONTEXT` environment values passed to `tab create`, so an ordinary restored shell does not automatically regain this plugin's Kubernetes isolation or prompt marker.
+After a laptop or normal Herdr server restart, Herdr restores the workspace, tab, pane layout, and working directory, but the original shell process no longer exists. Herdr does not currently persist the custom `KUBECONFIG` or `HERDR_K8S_CONTEXT` environment values passed to `tab create`, so an ordinary restored shell does not automatically regain this plugin's Kubernetes isolation or prompt marker. This limitation was last verified with Herdr 0.7.5 and is covered by the release checklist.
 
 The generated kubeconfig is retained while the restored tab still exists and is deleted when that tab is closed. This conservative behavior also avoids breaking a live handoff whose original shell still uses the file. Reopen the plugin popup and create a new isolated tab when Kubernetes isolation is needed after a full server restart.
 

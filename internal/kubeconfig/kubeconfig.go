@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/tkuchiki/herdr-plugin-k8s-context/internal/securefile"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
@@ -36,8 +37,8 @@ func ContextNames(config *clientcmdapi.Config) []string {
 	return names
 }
 
-// Prepare creates a self-contained copy for one Herdr tab. When contextName is
-// empty all contexts are retained. Otherwise only the selected context and its
+// Prepare creates a flattened copy for one Herdr tab. When contextName is empty
+// all contexts are retained. Otherwise only the selected context and its
 // referenced cluster and user are retained.
 func Prepare(source *clientcmdapi.Config, contextName, namespace string) (*clientcmdapi.Config, error) {
 	if source == nil {
@@ -80,70 +81,48 @@ func Prepare(source *clientcmdapi.Config, contextName, namespace string) (*clien
 	return config, nil
 }
 
-// Write stores config atomically below stateDir/kubeconfigs with private
-// permissions and returns its absolute path.
-func Write(stateDir string, config *clientcmdapi.Config) (path string, err error) {
+// ReservePath returns a random absolute path below stateDir/kubeconfigs. It
+// does not create the final file, allowing callers to persist lifecycle state
+// before installing credentials at that path.
+func ReservePath(stateDir string) (string, error) {
 	if stateDir == "" {
-		return "", errors.New("write kubeconfig: state directory is empty")
-	}
-	if config == nil {
-		return "", errors.New("write kubeconfig: configuration is nil")
+		return "", errors.New("reserve kubeconfig: state directory is empty")
 	}
 
 	dir, err := filepath.Abs(filepath.Join(stateDir, "kubeconfigs"))
 	if err != nil {
-		return "", fmt.Errorf("resolve kubeconfig directory: %w", err)
+		return "", fmt.Errorf("reserve kubeconfig: resolve directory: %w", err)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("create kubeconfig directory: %w", err)
+		return "", fmt.Errorf("reserve kubeconfig: create directory: %w", err)
 	}
 	if err := os.Chmod(dir, 0o700); err != nil {
-		return "", fmt.Errorf("secure kubeconfig directory: %w", err)
+		return "", fmt.Errorf("reserve kubeconfig: secure directory: %w", err)
 	}
-
-	contents, err := clientcmd.Write(*config)
-	if err != nil {
-		return "", fmt.Errorf("serialize kubeconfig: %w", err)
-	}
-
-	tmp, err := os.CreateTemp(dir, ".kubeconfig-*.tmp")
-	if err != nil {
-		return "", fmt.Errorf("create temporary kubeconfig: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		if err != nil {
-			_ = tmp.Close()
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	if err = tmp.Chmod(0o600); err != nil {
-		return "", fmt.Errorf("secure temporary kubeconfig: %w", err)
-	}
-	if _, err = tmp.Write(contents); err != nil {
-		return "", fmt.Errorf("write temporary kubeconfig: %w", err)
-	}
-	if err = tmp.Sync(); err != nil {
-		return "", fmt.Errorf("sync temporary kubeconfig: %w", err)
-	}
-	if err = tmp.Close(); err != nil {
-		return "", fmt.Errorf("close temporary kubeconfig: %w", err)
-	}
-
 	name, err := randomName()
 	if err != nil {
 		return "", err
 	}
-	path = filepath.Join(dir, name+".yaml")
-	if err = os.Rename(tmpPath, path); err != nil {
-		return "", fmt.Errorf("install kubeconfig: %w", err)
+	return filepath.Join(dir, name+".yaml"), nil
+}
+
+// WriteToPath atomically installs config at a path returned by ReservePath.
+func WriteToPath(path string, config *clientcmdapi.Config) error {
+	if path == "" {
+		return errors.New("write kubeconfig: path is empty")
 	}
-	if err = os.Chmod(path, 0o600); err != nil {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("secure kubeconfig: %w", err)
+	if config == nil {
+		return errors.New("write kubeconfig: configuration is nil")
 	}
-	return path, nil
+	contents, err := clientcmd.Write(*config)
+	if err != nil {
+		return fmt.Errorf("serialize kubeconfig: %w", err)
+	}
+
+	if err := securefile.WriteAtomic(path, ".kubeconfig-*.tmp", contents); err != nil {
+		return fmt.Errorf("write kubeconfig: %w", err)
+	}
+	return nil
 }
 
 func randomName() (string, error) {
